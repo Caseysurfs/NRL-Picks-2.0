@@ -82,7 +82,7 @@ def run_elo(df: pd.DataFrame, K=30.0, HFA=60.0):
             y = 0.5
         elif r.hs > r.as:
             y = 1.0
-        else:
+        else
             y = 0.0
 
         margin = abs(r.hs - r.as)
