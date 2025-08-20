@@ -2,7 +2,7 @@ name: NRL weekly picks 2.0
 
 on:
   schedule:
-    - cron: "0 23 * * SUN"     # 23:00 UTC Sunday = 09:00 AEST Monday
+    - cron: "0 23 * * SUN"   # 23:00 UTC Sunday = 09:00 AEST Monday
   workflow_dispatch:
 
 jobs:
@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: pip install requests pandas numpy pytz
 
-      # 👇 This step writes a CLEAN Python file on the runner (no smart punctuation).
+      # Write a CLEAN ASCII python file at runtime to avoid smart punctuation issues
       - name: Write nrl_picks_v2.py (clean ASCII)
         run: |
           cat > nrl_picks_v2.py <<'PY'
@@ -264,6 +265,4 @@ jobs:
           ls -la reports || true
           git add reports/*.csv
           git commit -m "NRL picks 2.0 $(date -u +'%Y-%m-%d %H:%M UTC')" || echo "No changes to commit"
-          git push
-te -u +'%Y-%m-%d %H:%M UTC')" || echo "No changes to commit"
           git push
