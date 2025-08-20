@@ -2,7 +2,7 @@ name: NRL weekly picks 2.0
 
 on:
   schedule:
-    - cron: "0 23 * * SUN"   # 23:00 UTC Sunday = 09:00 AEST Monday
+    - cron: "0 23 * * SUN"     # 23:00 UTC Sunday = 09:00 AEST Monday
   workflow_dispatch:
 
 jobs:
@@ -22,21 +22,239 @@ jobs:
       - name: Install dependencies
         run: pip install requests pandas numpy pytz
 
-      - name: Show repo tree (debug)
+      # 👇 This step writes a CLEAN Python file on the runner (no smart punctuation).
+      - name: Write nrl_picks_v2.py (clean ASCII)
         run: |
-          pwd
-          ls -la
-          echo "----"
-          find . -maxdepth 3 -type f -name "*nrl*py" -print
+          cat > nrl_picks_v2.py <<'PY'
+          import os, math, datetime as dt
+          from pathlib import Path
+          import pandas as pd, numpy as np, pytz, requests
+
+          API_BASE = "https://api.the-odds-api.com/v4"
+          SPORT_KEY = "rugbyleague_nrl"
+          REGIONS = os.getenv("REGIONS", "au")
+          MARKETS = "h2h"
+          ODDS_FORMAT = "decimal"
+
+          BANKROLL = float(os.getenv("BANKROLL", "1000"))
+          KELLY_FACTOR = float(os.getenv("KELLY_FACTOR", "0.5"))
+          EDGE_MIN = float(os.getenv("EDGE_MIN", "0.02"))
+          MAX_KELLY = float(os.getenv("MAX_KELLY", "0.02"))
+
+          TZ_AEST = pytz.timezone("Australia/Brisbane")
+          API_KEY = os.getenv("THE_ODDS_API_KEY")
+
+          def now_aest_str():
+              return dt.datetime.now(TZ_AEST).strftime("%Y-%m-%d %H:%M")
+
+          def to_aest(iso_ts):
+              return dt.datetime.fromisoformat(iso_ts.replace("Z", "+00:00")).astimezone(TZ_AEST)
+
+          def logistic(x):
+              return 1.0 / (1.0 + 10.0 ** (-x / 400.0))
+
+          def devig_two_way(a, b):
+              if not (isinstance(a, (int, float)) and isinstance(b, (int, float))):
+                  return None, None
+              if a <= 1 or b <= 1:
+                  return None, None
+              pa, pb = 1.0 / a, 1.0 / b
+              s = pa + pb
+              return pa / s, pb / s
+
+          def kelly_fraction(p, dec_odds, k):
+              if dec_odds <= 1.0:
+                  return 0.0
+              b = dec_odds - 1.0
+              f = (p * (b + 1.0) - 1.0) / b
+              f = max(0.0, k * f)
+              return min(f, MAX_KELLY)
+
+          def fetch_scores_fallback(api_key):
+              windows = [365, 180, 120, 90, 60, 30, 14, 7, 3]
+              last = ""
+              for d in windows:
+                  try:
+                      r = requests.get(
+                          f"{API_BASE}/sports/{SPORT_KEY}/scores",
+                          params={"daysFrom": d, "apiKey": api_key}, timeout=30
+                      )
+                      if r.status_code != 200:
+                          last = f"{r.status_code} {r.text[:120]}"
+                          continue
+                      rows = []
+                      for g in r.json():
+                          if not g.get("completed"):
+                              continue
+                          home, away = g.get("home_team"), g.get("away_team")
+                          if not home or not away:
+                              continue
+                          pm = {s["name"]: float(s["score"]) for s in g.get("scores", [])}
+                          if home in pm and away in pm:
+                              t = dt.datetime.fromisoformat(g["commence_time"].replace("Z", "+00:00"))
+                              rows.append({"date": t, "home": home, "away": away, "hs": pm[home], "as": pm[away]})
+                      if rows:
+                          print(f"[scores] {len(rows)} completed games using daysFrom={d}.")
+                          return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+                  except Exception as e:
+                      last = str(e)
+                      continue
+              print(f"[scores] No historical scores found. Last error: {last}")
+              return pd.DataFrame(columns=["date", "home", "away", "hs", "as"])
+
+          def fetch_odds(api_key):
+              r = requests.get(
+                  f"{API_BASE}/sports/{SPORT_KEY}/odds",
+                  params={"apiKey": api_key, "regions": REGIONS, "markets": MARKETS, "oddsFormat": ODDS_FORMAT},
+                  timeout=30
+              )
+              r.raise_for_status()
+              return r.json()
+
+          def run_elo(df, K=30.0, HFA=60.0):
+              ratings = {}
+              eps = 1e-9
+              total = 0.0
+              n = 0
+              for _, row in df.iterrows():
+                  rh = ratings.get(row.home, 1500.0)
+                  ra = ratings.get(row.away, 1500.0)
+                  p_home = 1.0 / (1.0 + 10.0 ** (-((rh - ra + HFA) / 400.0)))
+                  if row.hs == row.as:
+                      y = 0.5
+                  elif row.hs > row.as:
+                      y = 1.0
+                  else:
+                      y = 0.0
+                  margin = abs(row.hs - row.as)
+                  k_eff = K * (1.0 + math.log1p(margin))
+                  ratings[row.home] = rh + k_eff * (y - p_home)
+                  ratings[row.away] = ra - k_eff * (y - p_home)
+                  total -= y * math.log(max(p_home, eps)) + (1.0 - y) * math.log(max(1.0 - p_home, eps))
+                  n += 1
+              return ratings, total / max(1, n)
+
+          def tune_elo(df):
+              best = None
+              params = {"K": 30.0, "HFA": 60.0}
+              for K in [15, 25, 35]:
+                  for HFA in [40, 60, 80]:
+                      _, loss = run_elo(df, K, HFA)
+                      if best is None or loss < best:
+                          best = loss
+                          params = {"K": K, "HFA": HFA}
+              return params
+
+          def main():
+              if not API_KEY:
+                  raise SystemExit("Missing THE_ODDS_API_KEY secret/env var.")
+
+              hist = fetch_scores_fallback(API_KEY)
+              if hist.empty:
+                  print("[elo] No history; using flat ratings, HFA=60.")
+                  ratings = {}
+                  params = {"HFA": 60}
+              else:
+                  params = tune_elo(hist)
+                  ratings, _ = run_elo(hist, params["K"], params["HFA"])
+                  print(f"[elo] Trained on {len(hist)} matches. Best: K={params['K']}, HFA={params['HFA']}.")
+
+              rows = []
+              try:
+                  events = fetch_odds(API_KEY)
+              except Exception as e:
+                  print(f"[odds] Error: {e}")
+                  events = []
+
+              for ev in events:
+                  home, away = ev.get("home_team"), ev.get("away_team")
+                  if not home or not away:
+                      continue
+                  ko = to_aest(ev["commence_time"])
+
+                  best_home = None
+                  best_away = None
+                  book_h = None
+                  book_a = None
+                  for bk in ev.get("bookmakers", []):
+                      bkey = bk.get("key")
+                      for m in bk.get("markets", []):
+                          if m.get("key") != "h2h":
+                              continue
+                          d = {o.get("name"): o.get("price") for o in m.get("outcomes", [])}
+                          ph = d.get(home)
+                          pa = d.get(away)
+                          if isinstance(ph, (int, float)) and (best_home is None or ph > best_home):
+                              best_home = ph
+                              book_h = bkey
+                          if isinstance(pa, (int, float)) and (best_away is None or pa > best_away):
+                              best_away = pa
+                              book_a = bkey
+                  if best_home is None or best_away is None:
+                      continue
+
+                  m_home, m_away = devig_two_way(best_home, best_away)
+                  if m_home is None:
+                      continue
+
+                  rh = ratings.get(home, 1500.0)
+                  ra = ratings.get(away, 1500.0)
+                  p_home = logistic((rh - ra) + params["HFA"])
+                  p_away = 1.0 - p_home
+
+                  edge_home = p_home - m_home
+                  edge_away = p_away - m_away
+
+                  if edge_home >= edge_away:
+                      side = "HOME"; p = p_home; price = best_home; mp = m_home; edge = edge_home; book = book_h; sel = home
+                  else:
+                      side = "AWAY"; p = p_away; price = best_away; mp = m_away; edge = edge_away; book = book_a; sel = away
+
+                  if edge < EDGE_MIN:
+                      continue
+
+                  stake_frac = kelly_fraction(p, price, KELLY_FACTOR)
+                  stake_amt = round(BANKROLL * stake_frac, 2)
+
+                  rows.append({
+                      "Generated (AEST)": now_aest_str(),
+                      "Kickoff (AEST)": ko.strftime("%Y-%m-%d %H:%M"),
+                      "Match": f"{home} vs {away}",
+                      "Pick": f"{side} — {sel}",
+                      "Book": book,
+                      "Best Odds": price,
+                      "Market p (de-vig)": round(mp, 4),
+                      "Model p (Elo)": round(float(p), 4),
+                      "Edge": round(float(edge), 4),
+                      "Kelly % (½-Kelly, cap)": round(stake_frac * 100, 2),
+                      f"Stake (Bankroll={int(BANKROLL)})": stake_amt,
+                      "Potential Profit (if win)": round(stake_amt * (price - 1), 2),
+                      "Potential Return (if win)": round(stake_amt * price, 2),
+                      "EV Profit (model)": round(stake_amt * (p * (price - 1) - (1.0 - p)), 2),
+                  })
+
+              df = pd.DataFrame(rows).sort_values(["Kickoff (AEST)", "Edge"], ascending=[True, False]).reset_index(drop=True)
+              outdir = Path("reports")
+              outdir.mkdir(parents=True, exist_ok=True)
+              fname = outdir / f"nrl_picks_{dt.datetime.now(TZ_AEST).strftime('%Y%m%d_%H%M')}.csv"
+              df.to_csv(fname, index=False)
+              print(f"[output] Saved {len(df)} picks -> {fname}")
+              if df.empty:
+                  print("[note] Empty CSV = no edges >= EDGE_MIN or odds not available.")
+              print("[responsible] Bet sensibly. BetStop & Gambling Help Online 1800 858 858 (AU).")
+
+          if __name__ == "__main__":
+              main()
+          PY
 
       - name: Generate NRL picks
         env:
           THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
-          BANKROLL: "1000"       # change later if you want
-          KELLY_FACTOR: "0.5"    # half-Kelly
-          EDGE_MIN: "0.02"       # only include edges >= 2%
-          MAX_KELLY: "0.02"      # cap bet at 2% of bankroll
-          REGIONS: "au"          # add ",uk" if your plan allows
+          BANKROLL: "1000"
+          KELLY_FACTOR: "0.5"
+          EDGE_MIN: "0.02"
+          MAX_KELLY: "0.02"
+          REGIONS: "au"
         run: python nrl_picks_v2.py
 
       - name: Commit CSV results
@@ -46,4 +264,6 @@ jobs:
           ls -la reports || true
           git add reports/*.csv
           git commit -m "NRL picks 2.0 $(date -u +'%Y-%m-%d %H:%M UTC')" || echo "No changes to commit"
+          git push
+te -u +'%Y-%m-%d %H:%M UTC')" || echo "No changes to commit"
           git push
