@@ -67,33 +67,44 @@ def fetch_odds(api_key):
     r.raise_for_status(); return r.json()
 
 def run_elo(df: pd.DataFrame, K=30.0, HFA=60.0):
+    """
+    Run an Elo rating system on match results.
+    df should have columns: ["date", "home", "away", "hs", "as"]
+    """
     ratings = {}
     eps = 1e-9
-    ll = 0.0
-    n = 0
+    total_log_loss = 0.0
+    n_games = 0
 
-    for _, r in df.iterrows():
-        rh = ratings.get(r.home, 1500.0)
-        ra = ratings.get(r.away, 1500.0)
-        p_home = 1.0 / (1.0 + 10.0 ** (-( (rh - ra) + HFA ) / 400.0))
+    for _, row in df.iterrows():
+        rh = ratings.get(row.home, 1500.0)
+        ra = ratings.get(row.away, 1500.0)
 
-        # outcome y (home perspective) — use multi-line block to avoid copy/paste glitches
-        if r.hs == r.as:
+        # expected win probability for home team
+        p_home = 1.0 / (1.0 + 10.0 ** (-((rh - ra + HFA) / 400.0)))
+
+        # actual outcome from home perspective
+        if row.hs == row.as:
             y = 0.5
-        elif r.hs > r.as:
+        elif row.hs > row.as:
             y = 1.0
-        else
+        else:
             y = 0.0
 
-        margin = abs(r.hs - r.as)
+        margin = abs(row.hs - row.as)
         k_eff = K * (1.0 + math.log1p(margin))
 
-        ratings[r.home] = rh + k_eff * (y - p_home)
-        ratings[r.away] = ra - k_eff * (y - p_home)
+        # update ratings
+        ratings[row.home] = rh + k_eff * (y - p_home)
+        ratings[row.away] = ra - k_eff * (y - p_home)
 
-        # negative log-likelihood
-        ll -= y * math.log(max(p_home, eps)) + (1.0 - y) * math.log(max(1.0 - p_home, eps))
-        n += 1
+        # accumulate log-loss for calibration
+        total_log_loss -= y * math.log(max(p_home, eps)) + (1 - y) * math.log(max(1 - p_home, eps))
+        n_games += 1
+
+    avg_log_loss = total_log_loss / max(1, n_games)
+    return ratings, avg_log_loss
+
 
     return ratings, ll / max(n, 1)
 
