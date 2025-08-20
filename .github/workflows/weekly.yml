@@ -1,0 +1,49 @@
+name: NRL weekly picks 2.0
+
+on:
+  schedule:
+    - cron: "0 23 * * SUN"   # 23:00 UTC Sunday = 09:00 AEST Monday
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas numpy pytz
+
+      - name: Show repo tree (debug)
+        run: |
+          pwd
+          ls -la
+          echo "----"
+          find . -maxdepth 3 -type f -name "*nrl*py" -print
+
+      - name: Generate NRL picks
+        env:
+          THE_ODDS_API_KEY: ${{ secrets.THE_ODDS_API_KEY }}
+          BANKROLL: "1000"       # change later if you want
+          KELLY_FACTOR: "0.5"    # half-Kelly
+          EDGE_MIN: "0.02"       # only include edges >= 2%
+          MAX_KELLY: "0.02"      # cap bet at 2% of bankroll
+          REGIONS: "au"          # add ",uk" if your plan allows
+        run: python nrl_picks_v2.py
+
+      - name: Commit CSV results
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          ls -la reports || true
+          git add reports/*.csv
+          git commit -m "NRL picks 2.0 $(date -u +'%Y-%m-%d %H:%M UTC')" || echo "No changes to commit"
+          git push
