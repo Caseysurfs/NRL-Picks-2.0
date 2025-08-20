@@ -66,18 +66,37 @@ def fetch_odds(api_key):
                    timeout=30)
     r.raise_for_status(); return r.json()
 
-def run_elo(df, K=30.0, HFA=60.0):
-    ratings={}; eps=1e-9; ll=0.0; n=0
-    for _,r in df.iterrows():
-        rh,ra=ratings.get(r.home,1500.0),ratings.get(r.away,1500.0)
-        p_home=logistic((rh-ra)+HFA)
-        if r.hs==r.as: y=0.5
-        elif r.hs>r.as: y=1.0
-        else: y=0.0
-        margin=abs(r.hs-r.as); k_eff=K*(1.0+math.log1p(margin))
-        ratings[r.home]=rh+k_eff*(y-p_home); ratings[r.away]=ra-k_eff*(y-p_home)
-        ll-= y*math.log(max(p_home,eps)) + (1-y)*math.log(max(1-p_home,eps)); n+=1
-    return ratings, ll/max(n,1)
+def run_elo(df: pd.DataFrame, K=30.0, HFA=60.0):
+    ratings = {}
+    eps = 1e-9
+    ll = 0.0
+    n = 0
+
+    for _, r in df.iterrows():
+        rh = ratings.get(r.home, 1500.0)
+        ra = ratings.get(r.away, 1500.0)
+        p_home = 1.0 / (1.0 + 10.0 ** (-( (rh - ra) + HFA ) / 400.0))
+
+        # outcome y (home perspective) — use multi-line block to avoid copy/paste glitches
+        if r.hs == r.as:
+            y = 0.5
+        elif r.hs > r.as:
+            y = 1.0
+        else:
+            y = 0.0
+
+        margin = abs(r.hs - r.as)
+        k_eff = K * (1.0 + math.log1p(margin))
+
+        ratings[r.home] = rh + k_eff * (y - p_home)
+        ratings[r.away] = ra - k_eff * (y - p_home)
+
+        # negative log-likelihood
+        ll -= y * math.log(max(p_home, eps)) + (1.0 - y) * math.log(max(1.0 - p_home, eps))
+        n += 1
+
+    return ratings, ll / max(n, 1)
+
 
 def tune_elo(df):
     best=None; params={"K":30.0,"HFA":60.0}
