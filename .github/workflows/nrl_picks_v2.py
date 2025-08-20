@@ -1,4 +1,4 @@
-# nrl_picks_v2.py 
+# nrl_picks_v2.py — NRL Picks 2.0 (GitHub Actions) 
 
 import os, math, datetime as dt
 from pathlib import Path
